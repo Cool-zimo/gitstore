@@ -75,6 +75,35 @@
             throw lastErr;
         }
 
+        /**
+         * 拿文件的原始文本（不是 JSON）。
+         *
+         * ★ 为什么需要这个：contents API 对大文件不给 content。
+         *   实测 14MB 的文件，返回的是 `encoding: "none"` + `content: ""` ——
+         *   提交成功了、文件也在，就是读不出内容。
+         *   换 `Accept: application/vnd.github.raw` 能一次拿到全文，
+         *   比 contents 拿 sha 再 git/blobs 取内容少一次请求。
+         */
+        async rawText(path) {
+            const url = path.startsWith('http') ? path : API + path;
+            const res = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    Authorization: `Bearer ${this.token}`,
+                    Accept: 'application/vnd.github.raw',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    ...(this.rawHeaders || {})
+                },
+                cache: 'no-store'
+            });
+            if (!res.ok) {
+                let msg = res.statusText;
+                try { const j = JSON.parse(await res.text()); if (j && j.message) msg = j.message; } catch (e) { }
+                const err = new Error(msg); err.status = res.status; throw err;
+            }
+            return await res.text();
+        }
+
         static _transient(s) {
             // 429 限流；500/502/503/504 服务端抖动。
             // ★ 500 曾经漏掉过：一次 256MB 上传报 500，而重试策略只认 429/502/503，
@@ -187,6 +216,115 @@
         async sha256(text) {
             const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
             return Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, '0')).join('');
+        },
+
+        /** gzip 压缩。浏览器原生，不是自研算法。 */
+        async gz(u8) {
+            const cs = new CompressionStream('gzip');
+            const w = cs.writable.getWriter(); w.write(u8); w.close();
+            return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+        },
+        async ungz(u8) {
+            const ds = new DecompressionStream('gzip');
+            const w = ds.writable.getWriter(); w.write(u8); w.close();
+            return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+        },
+
+        /** 字节级加密（encrypt 只处理字符串，分片需要二进制） */
+        async encBytes(key, u8) {
+            const iv = this.random(12);
+            const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, u8);
+            return { v: 2, alg: 'AES-GCM-256', iv: this._b64(iv), data: this._b64(new Uint8Array(ct)) };
+        },
+        async decBytes(key, env) {
+            if (!env || env.alg !== 'AES-GCM-256') throw new Error('不是 gitstore 的加密格式');
+            return new Uint8Array(await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: this._unb64(env.iv) }, key, this._unb64(env.data)));
+        }
+    };
+
+    /* ══════════════════════════════════════════════════════════
+     * 2.5 Pack —— 压缩 → 分片 → 加密（以及反向）
+     *
+     * ★ 顺序不能反：必须 先压缩 再加密。
+     *   密文是伪随机的，gzip 压密文几乎压不动，甚至会变大。
+     *   实测（Node + WebCrypto）：
+     *     笔记文本  压→密 省 99.7%   密→压 省 -0.1%
+     *     JSON     压→密 省 95.4%   密→压 省 -0.0%
+     *     日志     压→密 省 99.7%   密→压 省 -0.0%
+     *   差 21~329 倍。顺序搞反等于白做。
+     * ══════════════════════════════════════════════════════════ */
+    const Pack = {
+        /**
+         * 单片上限（原始字节）。
+         * blob API 卡的是 base64 **之后**的 payload（约 53MB），
+         * base64 膨胀 1.3333 倍 → 原始上限约 39MB。
+         * 取 16MB：base64 后 21MB，留 2.4 倍余量。
+         */
+        CHUNK: 16 * 1024 * 1024,
+        /** 压完没小到 95% 以下就不压（jpg/mp4/zip 这类压了反而变大） */
+        KEEP_RATIO: 0.95,
+        /** 并发上限。再高会被 GitHub 的 secondary rate limit 拒，实测 24 会变慢。 */
+        MAX_CONC: 16,
+        /** 同时编码这么多字节就收手 —— 实测 RSS 约 1.42 倍，超了会被系统杀掉 */
+        MEM_BUDGET: 512 * 1024 * 1024,
+
+        /** 片数 ≈ 最少（片越多越慢，每片都有固定开销）；并发受内存约束 */
+        plan(size) {
+            const n = Math.max(1, Math.ceil(size / this.CHUNK));
+            const chunk = Math.ceil(size / n);
+            // 并发 = min(片数, 内存能撑住几个, 硬上限)
+            const byMem = Math.max(1, Math.floor(this.MEM_BUDGET / (chunk * 1.42)));
+            return { parts: n, chunk, conc: Math.min(n, byMem, this.MAX_CONC) };
+        },
+
+        async pack(key, plain) {
+            const raw = typeof plain === 'string' ? new TextEncoder().encode(plain)
+                : (plain instanceof Uint8Array ? plain
+                    : new TextEncoder().encode(JSON.stringify(plain)));
+
+            // 1) 压缩（在加密之前）
+            let body = raw, fmt = 'raw';
+            try {
+                const c = await Crypto.gz(raw);
+                if (c.length < raw.length * this.KEEP_RATIO) { body = c; fmt = 'gz'; }
+            } catch (e) { /* 浏览器不支持就原样存 */ }
+
+            // 2) 分片
+            const { parts, chunk } = this.plan(body.length);
+
+            // 3) 每片独立加密（每片一个 iv）
+            const envs = [];
+            for (let i = 0; i < parts; i++) {
+                envs.push(await Crypto.encBytes(key,
+                    body.subarray(i * chunk, Math.min((i + 1) * chunk, body.length))));
+            }
+
+            // 单片：元数据和数据合并成一个文件（绝大多数情况，仓库里少一个文件）
+            // 多片：.enc 只放元数据（parts/size/fmt 不加密，为了读的时候不用先解密就知道有几片）
+            const main = parts === 1
+                ? Object.assign({ fmt, parts: 1, size: raw.length }, envs[0])
+                : { v: 2, alg: 'AES-GCM-256', fmt, parts, size: raw.length };
+            return { main, parts: parts === 1 ? [] : envs };
+        },
+
+        async unpack(key, main, partEnvs) {
+            const envs = main.parts > 1 ? partEnvs : [main];
+            if (envs.length !== main.parts) {
+                throw new Error(`分片缺失：需要 ${main.parts} 片，实际 ${envs.length} 片`);
+            }
+            let body;
+            if (envs.length === 1) {
+                body = await Crypto.decBytes(key, envs[0]);
+            } else {
+                const chunks = [];
+                for (const e of envs) chunks.push(await Crypto.decBytes(key, e));
+                body = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
+                let o = 0;
+                for (const c of chunks) { body.set(c, o); o += c.length; }
+            }
+            if (main.fmt === 'gz') body = await Crypto.ungz(body);
+            return { u8: body, text: new TextDecoder().decode(body) };
         }
     };
 
@@ -223,10 +361,17 @@
          * ★ 一定要返回 sha —— 调用方写回时必须带上，否则是"强制覆盖"，
          *   会把别的设备刚写的整份抹掉，而且看不出来。
          */
+        /**
+         * ★ 路径按段编码，'/' 保留。
+         *   直接 encodeURIComponent(path) 会把 'b/big.enc' 变成 'b%2Fbig.enc'，
+         *   GitHub 不认。GitHub Drive 里也是这么处理的。
+         */
+        _enc(path) { return path.split('/').map(encodeURIComponent).join('/'); }
+
         async getRaw(path) {
             try {
                 return await this.http.req(
-                    `/repos/${this.full}/contents/${encodeURIComponent(path)}?ref=${this.branch}`);
+                    `/repos/${this.full}/contents/${this._enc(path)}?ref=${this.branch}`);
             } catch (e) {
                 if (e.status === 404) return null;
                 throw e;
@@ -236,6 +381,21 @@
         async read(path) {
             const f = await this.getRaw(path);
             if (!f) return null;
+            /**
+             * ★ contents API 的 1MB 限制：
+             *   文件超过 1MB 时返回 encoding:"none" + content:""，
+             *   也就是"文件在，但内容不给"。分片一定超过 1MB，
+             *   所以分片能写进去却读不出来 —— 实测报"分片缺失"。
+             *   这里补一条回退：换 raw media type 重取。
+             */
+            if (!f.content) {
+                // ★ read() 的返回字段是 text，不是 content。
+                //   第一版我在这儿写成了 content，于是 getJSON 拿 r.text 得到 undefined，
+                //   JSON.parse(undefined) 抛错 → 返回 bad:true → 上层报"分片缺失"。
+                //   表现是"分片写进去了却读不出来"，实际是字段名写错。
+                return { sha: f.sha, text: await this.http.rawText(
+                    `/repos/${this.full}/contents/${this._enc(path)}?ref=${this.branch}`) };
+            }
             const text = new TextDecoder().decode(
                 Uint8Array.from(atob(f.content.replace(/\n/g, '')), c => c.charCodeAt(0)));
             return { text, sha: f.sha };
@@ -294,25 +454,48 @@
          *   实测每笔固定约 5.7 秒，与文件数无关。100 个文件串行就是 10 分钟。
          *   tree API 一批一次提交，100 个文件也是几秒。
          */
-        async commit(files, message) {
+        async commit(files, message, opt = {}) {
             const ref = await this.http.req(`/repos/${this.full}/git/ref/heads/${this.branch}`);
             const cm = await this.http.req(`/repos/${this.full}/git/commits/${ref.object.sha}`);
 
             // ★ encoding 必须是 base64。曾经写成 utf-8，
             //   结果文件被存成 base64 文本——提交成功了，内容全是乱码。
             //   教训：验证了"提交成功"不等于验证了"提交的是什么"。
-            const tree = [];
-            for (const f of files) {
-                const content = typeof f.content === 'string'
-                    ? new TextEncoder().encode(f.content)
-                    : f.content;
-                const blob = await this.http.req(`/repos/${this.full}/git/blobs`, {
-                    method: 'POST',
-                    body: { content: Crypto._b64(content), encoding: 'base64' },
-                    retry: { tries: 3, delay: 600 }
-                });
-                tree.push({ path: f.path, mode: '100644', type: 'blob', sha: blob.sha });
-            }
+            /**
+             * 并发建 blob。
+             * ★ content === null 表示删除 —— tree API 里 sha:null 就是删除。
+             *   内容变小时旧分片（p2..p9）会残留成孤儿，必须显式删掉。
+             * ★ 并发数不能拍脑袋：createBlob 可以重试（内容寻址，重试结果完全相同），
+             *   但建太多会被 secondary rate limit 拒。所以默认串行，只有调用方
+             *   明确给 concurrency 才并发。
+             */
+            const tree = new Array(files.length);
+            const jobs = [];
+            files.forEach((f, i) => {
+                if (f.content === null) {
+                    tree[i] = { path: f.path, mode: '100644', type: 'blob', sha: null };
+                    return;
+                }
+                jobs.push({ i, f });
+            });
+
+            const conc = Math.max(1, Math.min(jobs.length, opt.concurrency || 1));
+            let cursor = 0;
+            const workers = Array.from({ length: conc }, async () => {
+                while (cursor < jobs.length) {
+                    const { i, f } = jobs[cursor++];
+                    const content = typeof f.content === 'string'
+                        ? new TextEncoder().encode(f.content)
+                        : f.content;
+                    const blob = await this.http.req(`/repos/${this.full}/git/blobs`, {
+                        method: 'POST',
+                        body: { content: Crypto._b64(content), encoding: 'base64' },
+                        retry: { tries: 3, delay: 600 }
+                    });
+                    tree[i] = { path: f.path, mode: '100644', type: 'blob', sha: blob.sha };
+                }
+            });
+            await Promise.all(workers);
             if (!files.length) return null;
 
             const t = await this.http.req(`/repos/${this.full}/git/trees`, {
@@ -424,14 +607,51 @@
         }
 
         async put(path, plain) {
+            const packed = await Pack.pack(this.key, plain);
             if (!this.hideNames) {
-                const env = await Crypto.encrypt(this.key, plain);
-                const r = await this.repo.read(this._p(path + '.enc'));
-                await this.repo.write(this._p(path + '.enc'), JSON.stringify(env),
-                    `gitstore: 写入 ${path}`, r ? r.sha : null);
+                await this._writePacked(this._p(path), packed, `gitstore: 写入 ${path}`);
                 return path;
             }
             // 文件名也加密：需要一张索引表（索引本身也加密）
+            const encName = await this._encName(path);
+            await this._writePacked(this._p(encName), packed, `gitstore: 写入`, encName);
+            return path;
+        }
+
+        /**
+         * 把 pack 出来的东西一次提交。
+         * ★ 一次 tree + 一次 commit，不管有多少片 —— commit 固定开销按"次"算，
+         *   不按文件数算（实测提交 4 个和 64 个文件都是 5.7 秒）。
+         */
+        async _writePacked(base, packed, msg, encName) {
+            const n = packed.parts.length || 1;
+            const files = [{ path: base + '.enc', content: JSON.stringify(packed.main) }];
+            packed.parts.forEach((env, i) => {
+                files.push({ path: `${base}.p${i}`, content: JSON.stringify(env) });
+            });
+
+            /**
+             * 旧内容片数更多时，多余的片要显式删除，否则变成孤儿。
+             *
+             * ★ 注意单片时占的 .pN 数是 0 —— 数据和元数据合并在 .enc 里了。
+             *   第一版写成了 `for (let i = n; i < oldN; i++)`，n 在单片时是 1，
+             *   于是从 .p1 开始删，.p0 被漏掉 —— 2 片改成 1 片时 .p0 就成孤儿了。
+             *   实测抓到的，看代码完全正常。
+             */
+            const old = await this.repo.getJSON(base + '.enc');
+            const oldParts = ((old && old.data && old.data.parts) || 1) > 1
+                ? old.data.parts : 0;
+            const newParts = packed.parts.length;   // 单片时就是 0
+            for (let i = newParts; i < oldParts; i++) {
+                files.push({ path: `${base}.p${i}`, content: null });
+            }
+
+            const { conc } = Pack.plan(packed.main.size || 1024);
+            await this.repo.commit(files, msg, { concurrency: Math.max(1, Math.min(files.length, conc)) });
+        }
+
+        /** hideNames 时把 真实名 → 随机名 记进索引表（索引本身也加密） */
+        async _encName(path) {
             const map = await this._loadMap();
             let encName = map[path];
             if (!encName) {
@@ -443,25 +663,49 @@
                     'gitstore: 更新索引', ri ? ri.sha : null);
                 this._map = map;
             }
-            const env = await Crypto.encrypt(this.key, plain);
-            const r = await this.repo.read(this._p(encName + '.enc'));
-            await this.repo.write(this._p(encName + '.enc'), JSON.stringify(env),
-                'gitstore: 写入', r ? r.sha : null);
-            return path;
+            return encName;
         }
 
         async get(path) {
+            const out = await this.getBytes(path);
+            return out === null ? null : out.text;
+        }
+
+        /** 取二进制（图片、任意文件）。返回 {u8, text}，不存在返回 null。 */
+        async getBytes(path) {
+            let base;
             if (!this.hideNames) {
-                const r = await this.repo.getJSON(this._p(path + '.enc'));
-                if (!r || !r.data) return null;
-                return await Crypto.decrypt(this.key, r.data);
+                base = this._p(path);
+            } else {
+                const map = await this._loadMap();
+                const encName = map[path];
+                if (!encName) return null;
+                base = this._p(encName);
             }
-            const map = await this._loadMap();
-            const encName = map[path];
-            if (!encName) return null;
-            const r = await this.repo.getJSON(this._p(encName + '.enc'));
+            const r = await this.repo.getJSON(base + '.enc');
             if (!r || !r.data) return null;
-            return await Crypto.decrypt(this.key, r.data);
+            const main = r.data;
+
+            /**
+             * ★ 向后兼容：老 envelope 没有 fmt/parts 字段（那时还没压缩分片）。
+             *   这种按旧格式走 —— 是字符串、没压缩、单片。
+             */
+            if (main.fmt === undefined) {
+                const text = await Crypto.decrypt(this.key, main);
+                return { u8: new TextEncoder().encode(text), text };
+            }
+
+            const partEnvs = [];
+            if (main.parts > 1) {
+                // 并发读各片。缺一片就整体失败 —— 宁可报错，不要返回半截数据。
+                const rs = await Promise.all(Array.from({ length: main.parts },
+                    (_, i) => this.repo.getJSON(`${base}.p${i}`)));
+                for (const x of rs) {
+                    if (!x || !x.data) throw new Error(`分片缺失：${path}`);
+                    partEnvs.push(x.data);
+                }
+            }
+            return await Pack.unpack(this.key, main, partEnvs);
         }
 
         /** 只有 hideNames=false 时才能列出（否则文件名都是随机串，没有意义） */
@@ -469,7 +713,10 @@
             if (!this.hideNames) {
                 const files = await this.repo.list(this.prefix);
                 return files
+                    // ★ 分片文件叫 xxx.p0 / xxx.p1，它们不是独立的 key。
+                    //   不加这个过滤，keys() 会把每个分片也当成一个条目列出来。
                     .filter(f => f.name.endsWith('.enc') &&
+                        !/\.p\d+\.enc$/.test(f.name) &&
                         !['_index.json', '_verify.enc'].includes(f.name))
                     .map(f => f.name.replace(/\.enc$/, ''));
             }

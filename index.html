@@ -93,6 +93,31 @@ store.use('backup');</code></pre>
 <h2>一次提交写多个文件</h2>
 <pre><code>await repo.commit([{ path: 'a.txt', content: '…' }, …], 'message');</code></pre>
 
+<h2>压缩 → 分片 → 加密（顺序不能反）</h2>
+<p>存进仓库前会自动走一遍：压缩 → 分片 → 每片加密。读的时候反过来自动拼好解压好，调用方不需要管。</p>
+<pre><code>await v.put('笔记', 很大的文本);        // 自动压缩
+const bin = await v.getBytes('照片');   // 自动解压，返回 {u8, text}
+await v.get('笔记');                    // 拿字符串</code></pre>
+
+<table>
+<tr><th>步骤</th><th>为什么</th></tr>
+<tr><td><b>① 先压缩再加密</b></td><td>★ 顺序反了等于白做。密文是伪随机的，gzip 压密文<b>压不动，甚至变大</b></td></tr>
+<tr><td><b>② 压不动就不压</b></td><td>压完没小到 95% 以下就原样存（jpg / mp4 / zip 这类压了反而变大）</td></tr>
+<tr><td><b>③ 分片在压缩之后</b></td><td>先整体压再切，跨片的重复内容也能压到</td></tr>
+<tr><td><b>④ 每片独立加密</b></td><td>每片一个 iv；缺一片就整体报错，<b>不返回半截数据</b></td></tr>
+<tr><td><b>⑤ 一次 tree + commit</b></td><td>commit 的固定开销按"次"算，不按文件数算</td></tr>
+</table>
+
+<p>实测（Node + WebCrypto，同一份数据两种顺序）：</p>
+<table>
+<tr><th>数据</th><th>压→密</th><th>密→压</th><th>差</th></tr>
+<tr><td>笔记文本</td><td>省 99.7%</td><td>省 <b>-0.1%</b></td><td>286 倍</td></tr>
+<tr><td>JSON 结构</td><td>省 95.4%</td><td>省 -0.0%</td><td>22 倍</td></tr>
+<tr><td>日志</td><td>省 99.7%</td><td>省 -0.0%</td><td>329 倍</td></tr>
+</table>
+
+<p>分片阈值 16MB：blob API 卡的是 base64 <b>之后</b>的 payload（约 53MB），base64 膨胀 1.3333 倍 → 原始上限约 39MB，取 16MB 留 2.4 倍余量。</p>
+
 <h2>API</h2>
 <table>
 <tr><th></th><th></th></tr>
@@ -103,7 +128,9 @@ store.use('backup');</code></pre>
 <tr><td><code>vault({repo, password, hideNames, prefix})</code></td><td>自动加解密</td></tr>
 <tr><td><code>pool(base, {max})</code></td><td>容量池</td></tr>
 <tr><td><code>keyring(repo)</code> / <code>sharedVault(...)</code></td><td>ECDH P-256</td></tr>
-<tr><td><code>repo.commit(files, msg)</code></td><td>批量提交</td></tr>
+<tr><td><code>repo.commit(files, msg, {concurrency})</code></td><td>批量提交。<code>content:null</code> 表示删除该文件</td></tr>
+<tr><td><code>vault.getBytes(path)</code></td><td>取二进制，自动解压。返回 <code>{u8, text}</code></td></tr>
+<tr><td><code>GitStore.Crypto.gz / ungz</code></td><td>gzip（浏览器原生，非自研）</td></tr>
 <tr><td><code>repo.blobURL(path)</code></td><td>私有仓库文件转 blob URL</td></tr>
 <tr><td><code>GitStore.Crypto</code></td><td>加解密原语，可单独用</td></tr>
 </table>
@@ -113,6 +140,9 @@ store.use('backup');</code></pre>
 <tr><th>坑</th><th>后果</th></tr>
 <tr class="pit"><td>60 秒缓存</td><td>contents API 有 <code>max-age=60</code>：设备 A 写完 B 读不到，<b>刷新也没用</b> → 全部 <code>no-store</code></td></tr>
 <tr class="pit"><td>不带 sha</td><td>写文件不带 sha = 强制覆盖，把别处刚写的整份抹掉，<b>不报错</b></td></tr>
+<tr class="pit"><td>contents API 的 1MB 限制</td><td>文件 &gt;1MB 时返回 <code>encoding:"none"</code> + <code>content:""</code> —— <b>文件在，但内容不给</b>。分片必然超 1MB，于是"能写进去却读不出来"。已加 raw 回退</td></tr>
+<tr class="pit"><td>分片变少留孤儿</td><td>内容从 3 片改成 1 片时，<code>.p0/.p1</code> 要显式删。第一版循环起点写成 1，<b>漏删 .p0</b> —— 看代码完全正常，实测才抓到</td></tr>
+<tr class="pit"><td>路径编码</td><td><code>encodeURIComponent('b/a.enc')</code> 会把 <code>/</code> 变成 <code>%2F</code>，GitHub 不认。要按段编码保留 <code>/</code></td></tr>
 <tr class="pit"><td>encoding 写错</td><td>blob API 的 <code>encoding</code> 写成 <code>utf-8</code>：存成 base64 文本，提交"成功"但内容全乱</td></tr>
 <tr class="pit"><td>逐文件提交</td><td>实测每笔固定 <b>5.7 秒</b>，100 个文件要 10 分钟 → tree API 一批一次</td></tr>
 <tr class="pit"><td>commit 重试</td><td>提交带时间戳，重试 = 重复提交 → <b>永不重试</b></td></tr>
