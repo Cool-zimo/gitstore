@@ -943,6 +943,39 @@
     GitStore.Pool = Pool;
     GitStore.Vault = Vault;
 
+    /* ══════════════════════════════════════════════════════════
+     * API 版本
+     * ══════════════════════════════════════════════════════════
+     *
+     * ★ 为什么要有这个数
+     *   它是独立发布的轮子：AnyLearn / GitHub Drive / FaceHub / 仓鼠
+     *   都通过 CDN 或拷贝引入。v（缓存版本号）只回答"文件新旧"，
+     *   回答不了"这些文件能不能配合工作"。
+     *
+     *   典型事故：gitstore 给 put() 加了个必填参数，而 Drive 还是老写法 ——
+     *   两边版本号都对得上，跑起来才炸。有了 api_v 就能在加载时当场报出来。
+     *
+     * ★ 什么时候 bump（+1），什么时候不 bump
+     *   bump：改/删 公开方法签名、改方法名、改 localStorage 键结构、
+     *         改回调参数个数或顺序、删掉某个导出的 class
+     *   不 bump：只改函数内部实现、加可选参数（有默认值）、
+     *           加新方法、修 bug、改注释
+     *
+     * ★ 调用方怎么用
+     *   GitStore.requireApi(1);   // 需要 1 及以上，不满足直接抛错
+     */
+    GitStore.API_VERSION = 1;
+
+    GitStore.requireApi = function (need) {
+        need = Number(need) || 0;
+        if (GitStore.API_VERSION < need) {
+            throw new Error('gitstore API 版本过低：需要 '
+                + need + '，实际加载的是 ' + GitStore.API_VERSION
+                + '。请更新引入地址里的版本。');
+        }
+        return true;
+    };
+
     /*
      * ★ 参数名叫 root，不叫 global。
      *   叫 global 的话，在 Node 的 CommonJS 里会遮蔽真正的全局对象
